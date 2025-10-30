@@ -17,7 +17,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
+	_ "go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
@@ -26,24 +26,29 @@ import (
 
 const (
 	messageCheckInterval = 5 * time.Second  // Intervalo entre verificações do banco
-	messageDelay = 3 * time.Second          // Delay entre mensagens
+	messageDelay = 5 * time.Second          // Delay entre mensagens (aumentado para 5s)
+	maxMessagesPerBatch = 30                // Número máximo de mensagens por lote
 	dbPath = "./banco/msg.db"
 )
 
-// EventHandler implementa os callbacks para eventos do WhatsApp
-type EventHandler struct {
-	client *whatsmeow.Client
-	db     *Database
+// Cache de grupos para evitar consultas repetidas
+type GroupCache struct {
+	groups     []*types.GroupInfo
+	lastUpdate time.Time
+	mu         sync.RWMutex
 }
 
+// EventHandler implementa os callbacks para eventos do WhatsApp
+type EventHandler struct {
+	client      *whatsmeow.Client
+	db          *Database
+	groupCache  *GroupCache
+	cacheMutex  sync.Mutex
+}
+
+// HandleEvent lida com eventos do WhatsApp
 func (handler *EventHandler) HandleEvent(evt interface{}) {
-	switch v := evt.(type) {
-	case *events.Message:
-		if v.Info.IsFromMe {
-			return
-		}
-		fmt.Printf("Mensagem recebida de %s: %s\n", v.Info.Sender.String(), v.Message.GetConversation())
-	}
+	// Por enquanto apenas um stub vazio, já que não estamos processando eventos
 }
 
 // processMessageQueue processa a fila de mensagens pendentes
@@ -62,13 +67,19 @@ func (handler *EventHandler) processMessageQueue(ctx context.Context) {
 				continue
 			}
 
-			for _, msg := range messages {
+			if len(messages) > 0 {
+				log.Printf("Processando lote de %d mensagens...", len(messages))
+			}
+
+			for i, msg := range messages {
+				log.Printf("Processando mensagem %d/%d - Destinatário: %s", i+1, len(messages), msg.Para)
+				
 				// Adiciona delay entre mensagens
 				time.Sleep(messageDelay)
 
 				err := handler.sendMessage(ctx, msg)
 				if err != nil {
-					log.Printf("Erro ao enviar mensagem para %s: %v", msg.Para, err)
+					log.Printf("❌ Erro ao enviar mensagem para %s: %v", msg.Para, err)
 					// Atualiza status para erro (2)
 					if updateErr := handler.db.UpdateMessageStatus(ctx, msg, 2); updateErr != nil {
 						log.Printf("Erro ao atualizar status da mensagem: %v", updateErr)
@@ -76,10 +87,16 @@ func (handler *EventHandler) processMessageQueue(ctx context.Context) {
 					continue
 				}
 
+				log.Printf("✅ Mensagem enviada com sucesso para %s", msg.Para)
+
 				// Atualiza status para enviado com sucesso (1)
 				if err := handler.db.UpdateMessageStatus(ctx, msg, 1); err != nil {
 					log.Printf("Erro ao atualizar status da mensagem: %v", err)
 				}
+			}
+
+			if len(messages) > 0 {
+				log.Printf("Lote de mensagens processado. Aguardando próximo ciclo...")
 			}
 		}
 	}
@@ -90,22 +107,79 @@ func (handler *EventHandler) sendMessage(ctx context.Context, msg Message) error
 	var targetJID types.JID
 
 	if msg.Destino == "Grupo" {
-		groups, err := handler.client.GetJoinedGroups(ctx)
-		if err != nil {
-			return fmt.Errorf("erro ao buscar grupos: %v", err)
-		}
-
-		found := false
-		for _, group := range groups {
-			if group.Name == msg.Para {
-				targetJID = group.JID
-				found = true
-				break
+		// Primeiro tenta usar o cache
+		handler.groupCache.mu.RLock()
+		cacheAge := time.Since(handler.groupCache.lastUpdate)
+		foundInCache := false
+		
+		// Se o cache tem menos de 5 minutos, usa ele
+		if cacheAge < 5*time.Minute && len(handler.groupCache.groups) > 0 {
+			for _, group := range handler.groupCache.groups {
+				if group.Name == msg.Para {
+					targetJID = group.JID
+					foundInCache = true
+					break
+				}
 			}
 		}
-
-		if !found {
-			return fmt.Errorf("grupo não encontrado: %s", msg.Para)
+		handler.groupCache.mu.RUnlock()
+		
+		if foundInCache {
+			log.Printf("Grupo encontrado no cache (idade: %v)", cacheAge.Round(time.Second))
+		} else {
+			// Se não encontrou no cache, atualiza a lista de grupos
+			log.Printf("Atualizando cache de grupos...")
+			
+			// Implementa retry com backoff exponencial
+			maxRetries := 3 // Reduzido para 3 tentativas
+			baseDelay := 5 * time.Second // Aumentado para 5 segundos
+			var lastErr error
+			var groups []*types.GroupInfo
+			
+			for attempt := 0; attempt < maxRetries; attempt++ {
+				if attempt > 0 {
+					delay := baseDelay * time.Duration(1<<uint(attempt))
+					log.Printf("Aguardando %v antes de tentar atualizar grupos (tentativa %d/%d)...", delay, attempt+1, maxRetries)
+					time.Sleep(delay)
+				}
+				
+				var err error
+				groups, err = handler.client.GetJoinedGroups(ctx)
+				if err == nil {
+					// Atualiza o cache
+					handler.groupCache.mu.Lock()
+					handler.groupCache.groups = groups
+					handler.groupCache.lastUpdate = time.Now()
+					handler.groupCache.mu.Unlock()
+					
+					// Procura o grupo na nova lista
+					for _, group := range groups {
+						if group.Name == msg.Para {
+							targetJID = group.JID
+							foundInCache = true
+							break
+						}
+					}
+					
+					if foundInCache {
+						log.Printf("Grupo encontrado após atualização do cache")
+						break
+					}
+					
+					lastErr = fmt.Errorf("grupo não encontrado: %s", msg.Para)
+					break
+				}
+				
+				if !strings.Contains(strings.ToLower(err.Error()), "rate-overlimit") {
+					return fmt.Errorf("erro ao buscar grupos: %v", err)
+				}
+				
+				lastErr = err
+			}
+			
+			if !foundInCache {
+				return fmt.Errorf("erro após %d tentativas: %v", maxRetries, lastErr)
+			}
 		}
 	} else {
 		// Formata o número para o padrão WhatsApp (adiciona código do país se necessário)
@@ -257,17 +331,41 @@ func (handler *EventHandler) sendMessage(ctx context.Context, msg Message) error
 			return fmt.Errorf("erro ao enviar mensagem com anexo: %v", err)
 		}
 	} else {
-		// Envia mensagem de texto normal
-		_, err := handler.client.SendMessage(ctx, targetJID, content)
-		if err != nil {
+		// Envia mensagem de texto normal com retry
+		var sendErr error
+		maxSendRetries := 3
+		baseSendDelay := 2 * time.Second
+		
+		for attempt := 0; attempt < maxSendRetries; attempt++ {
+			if attempt > 0 {
+				delay := baseSendDelay * time.Duration(1<<uint(attempt))
+				log.Printf("Aguardando %v antes de tentar reenviar (tentativa %d/%d)...", delay, attempt+1, maxSendRetries)
+				time.Sleep(delay)
+			}
+			
+			_, err := handler.client.SendMessage(ctx, targetJID, content)
+			if err == nil {
+				return nil // Mensagem enviada com sucesso
+			}
+			
+			if strings.Contains(strings.ToLower(err.Error()), "rate-overlimit") {
+				sendErr = err
+				continue // Tenta novamente após o delay
+			}
+			
 			return fmt.Errorf("erro ao enviar mensagem: %v", err)
 		}
+		
+		return fmt.Errorf("erro após %d tentativas de envio: %v", maxSendRetries, sendErr)
 	}
 
 	return nil
 }
 
 func main() {
+	// Configura o formato do log para incluir hora
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 
@@ -311,6 +409,9 @@ func main() {
 	eventHandler := &EventHandler{
 		client: client,
 		db:     db,
+		groupCache: &GroupCache{
+			groups: make([]*types.GroupInfo, 0),
+		},
 	}
 	client.AddEventHandler(eventHandler.HandleEvent)
 
