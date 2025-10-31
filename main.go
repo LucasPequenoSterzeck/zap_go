@@ -1,5 +1,7 @@
 package main
 
+// $env:GOOS="windows"; $env:GOARCH="amd64"; go build -o zap_win.exe
+
 import (
 	"context"
 	"fmt"
@@ -17,7 +19,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	_ "go.mau.fi/whatsmeow/types/events"
+	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
@@ -48,19 +50,31 @@ type EventHandler struct {
 
 // HandleEvent lida com eventos do WhatsApp
 func (handler *EventHandler) HandleEvent(evt interface{}) {
-	// Por enquanto apenas um stub vazio, já que não estamos processando eventos
+	switch v := evt.(type) {
+	case *events.Connected:
+		log.Printf("=== Evento Connected recebido! ===")
+	case *events.LoggedOut:
+		log.Printf("=== Evento LoggedOut recebido! Razão: %v ===", v.Reason)
+	case *events.Message:
+		log.Printf("=== Nova mensagem recebida de %s ===", v.Info.Sender)
+	}
 }
 
 // processMessageQueue processa a fila de mensagens pendentes
 func (handler *EventHandler) processMessageQueue(ctx context.Context) {
+	log.Println("=== Função processMessageQueue iniciada ===")
 	ticker := time.NewTicker(messageCheckInterval)
 	defer ticker.Stop()
-
+	
+	ciclo := 0
 	for {
+		ciclo++
 		select {
 		case <-ctx.Done():
+			log.Println("Contexto cancelado, encerrando processMessageQueue")
 			return
 		case <-ticker.C:
+			log.Printf("Ciclo %d: Verificando mensagens pendentes...", ciclo)
 			messages, err := handler.db.GetPendingMessages(ctx)
 			if err != nil {
 				log.Printf("Erro ao buscar mensagens pendentes: %v", err)
@@ -366,6 +380,9 @@ func main() {
 	// Configura o formato do log para incluir hora
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	
+	log.Println("=== Iniciando programa ===")
+	
+	
 	dbLog := waLog.Stdout("Database", "DEBUG", true)
 	clientLog := waLog.Stdout("Client", "DEBUG", true)
 
@@ -387,9 +404,18 @@ func main() {
 		log.Fatalf("Erro ao conectar ao banco de mensagens: %v", err)
 	}
 	defer db.Close()
-
-	// Criar contexto com cancelamento
+	
+	// Criar contexto com cancelamento principal
 	ctx, cancel := context.WithCancel(context.Background())
+	// Verifica se há mensagens no banco logo no início
+	ctxCheck, cancelCheck := context.WithTimeout(context.Background(), 5*time.Second)
+	msgs, err := db.GetPendingMessages(ctxCheck)
+	cancelCheck()
+	if err != nil {
+		log.Printf("Erro ao verificar mensagens iniciais: %v", err)
+	} else {
+		log.Printf("Status inicial: Encontradas %d mensagens pendentes no banco", len(msgs))
+	}
 	defer cancel()
 
 	// Conectar ao banco de dados SQLite do WhatsApp
@@ -415,15 +441,22 @@ func main() {
 	}
 	client.AddEventHandler(eventHandler.HandleEvent)
 
+	// Canal para sinalizar que a conexão foi estabelecida
+	connected := make(chan bool, 1) // Adicionando buffer de 1 para evitar deadlock
+
 	// Criar WaitGroup para gerenciar goroutines
 	var wg sync.WaitGroup
 
-	// Inicia o processamento de mensagens em uma goroutine
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		eventHandler.processMessageQueue(ctx)
-	}()
+	// Registra handler para eventos de conexão
+	client.AddEventHandler(func(evt interface{}) {
+		switch v := evt.(type) {
+		case *events.Connected:
+			log.Println("Evento Connected recebido!")
+			connected <- true
+		case *events.LoggedOut:
+			log.Printf("Evento LoggedOut recebido: %v", v)
+		}
+	})
 
 	if client.Store.ID == nil {
 		// No ID stored, new login required
@@ -448,6 +481,9 @@ func main() {
 					fmt.Print("\x1b[0m") // Resetar cor
 					fmt.Println("\nAguardando conexão...")
 				}
+			} else if evt.Event == "success" {
+				fmt.Println("Login realizado com sucesso!")
+				connected <- true
 			} else {
 				fmt.Printf("Login status: %s\n", evt.Event)
 			}
@@ -458,9 +494,39 @@ func main() {
 		if err != nil {
 			log.Fatalf("Erro ao conectar: %v", err)
 		}
+		// Se já estava logado, sinaliza conexão estabelecida
+		connected <- true
 	}
 
-	fmt.Println("Bot iniciado! Processando mensagens...")
+	// Aguarda a conexão ser estabelecida
+	log.Println("Aguardando conexão ser estabelecida...")
+	select {
+	case <-connected:
+		log.Println("Conexão estabelecida! Iniciando processamento de mensagens...")
+	case <-time.After(60 * time.Second):
+		log.Fatal("Timeout aguardando conexão")
+	}
+	
+	// Pequena pausa para garantir que a conexão está totalmente estabelecida
+	time.Sleep(2 * time.Second)
+	
+	// Verifica se há mensagens pendentes
+	messages, err := eventHandler.db.GetPendingMessages(ctx)
+	if err != nil {
+		log.Printf("Erro ao verificar mensagens pendentes: %v", err)
+	} else {
+		log.Printf("Encontradas %d mensagens pendentes para processamento", len(messages))
+	}
+	
+	// Inicia o processamento de mensagens em uma goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		log.Println("Iniciando goroutine de processamento de mensagens...")
+		eventHandler.processMessageQueue(ctx)
+	}()
+	
+	log.Println("Processamento de mensagens iniciado com sucesso")
 
 	// Listen to Ctrl+C
 	c := make(chan os.Signal, 1)
