@@ -46,6 +46,8 @@ type EventHandler struct {
 	db          *Database
 	groupCache  *GroupCache
 	cacheMutex  sync.Mutex
+	connected   bool
+	connMutex   sync.RWMutex
 }
 
 // HandleEvent lida com eventos do WhatsApp
@@ -53,11 +55,70 @@ func (handler *EventHandler) HandleEvent(evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Connected:
 		log.Printf("=== Evento Connected recebido! ===")
+		handler.connMutex.Lock()
+		handler.connected = true
+		handler.connMutex.Unlock()
 	case *events.LoggedOut:
 		log.Printf("=== Evento LoggedOut recebido! Razão: %v ===", v.Reason)
+		handler.connMutex.Lock()
+		handler.connected = false
+		handler.connMutex.Unlock()
+		// Tenta reconectar
+		go handler.attemptReconnect()
+	case *events.Disconnected:
+		log.Printf("=== Evento Disconnected recebido! ===")
+		handler.connMutex.Lock()
+		handler.connected = false
+		handler.connMutex.Unlock()
+		// Tenta reconectar
+		go handler.attemptReconnect()
 	case *events.Message:
 		log.Printf("=== Nova mensagem recebida de %s ===", v.Info.Sender)
 	}
+}
+
+// attemptReconnect tenta reconectar ao WhatsApp com backoff exponencial
+// isConnected verifica se o cliente está realmente conectado
+func (handler *EventHandler) isConnected() bool {
+	handler.connMutex.RLock()
+	defer handler.connMutex.RUnlock()
+	return handler.connected && handler.client.IsConnected()
+}
+
+func (handler *EventHandler) attemptReconnect() {
+	baseDelay := 5 * time.Second
+	maxAttempts := 5
+	
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		handler.connMutex.RLock()
+		if handler.connected {
+			handler.connMutex.RUnlock()
+			return
+		}
+		handler.connMutex.RUnlock()
+
+		delay := baseDelay * time.Duration(1<<uint(attempt))
+		log.Printf("Tentativa de reconexão %d/%d em %v...", attempt+1, maxAttempts, delay)
+		time.Sleep(delay)
+
+		err := handler.client.Connect()
+		if err != nil {
+			log.Printf("Erro na tentativa de reconexão: %v", err)
+			continue
+		}
+
+		// Espera um pouco para ver se a conexão se mantém
+		time.Sleep(2 * time.Second)
+		
+		handler.connMutex.RLock()
+		if handler.connected {
+			handler.connMutex.RUnlock()
+			log.Println("Reconexão bem sucedida!")
+			return
+		}
+		handler.connMutex.RUnlock()
+	}
+	log.Printf("Falha em reconectar após %d tentativas", maxAttempts)
 }
 
 // processMessageQueue processa a fila de mensagens pendentes
@@ -118,6 +179,11 @@ func (handler *EventHandler) processMessageQueue(ctx context.Context) {
 
 // sendMessage envia uma mensagem individual
 func (handler *EventHandler) sendMessage(ctx context.Context, msg Message) error {
+	// Verifica se está realmente conectado
+	if !handler.isConnected() {
+		return fmt.Errorf("cliente não está conectado ao WhatsApp")
+	}
+
 	var targetJID types.JID
 
 	if msg.Destino == "Grupo" {
@@ -349,12 +415,13 @@ func (handler *EventHandler) sendMessage(ctx context.Context, msg Message) error
 		var sendErr error
 		maxSendRetries := 3
 		baseSendDelay := 2 * time.Second
+		var currentDelay time.Duration
 		
 		for attempt := 0; attempt < maxSendRetries; attempt++ {
 			if attempt > 0 {
-				delay := baseSendDelay * time.Duration(1<<uint(attempt))
-				log.Printf("Aguardando %v antes de tentar reenviar (tentativa %d/%d)...", delay, attempt+1, maxSendRetries)
-				time.Sleep(delay)
+				currentDelay = baseSendDelay * time.Duration(1<<uint(attempt))
+				log.Printf("Aguardando %v antes de tentar reenviar (tentativa %d/%d)...", currentDelay, attempt+1, maxSendRetries)
+				time.Sleep(currentDelay)
 			}
 			
 			_, err := handler.client.SendMessage(ctx, targetJID, content)
@@ -362,9 +429,18 @@ func (handler *EventHandler) sendMessage(ctx context.Context, msg Message) error
 				return nil // Mensagem enviada com sucesso
 			}
 			
-			if strings.Contains(strings.ToLower(err.Error()), "rate-overlimit") {
+			errLower := strings.ToLower(err.Error())
+			if strings.Contains(errLower, "rate-overlimit") {
 				sendErr = err
 				continue // Tenta novamente após o delay
+			}
+			
+			// Se for erro de banco bloqueado, tenta novamente
+			if strings.Contains(errLower, "database is locked") || strings.Contains(errLower, "sqlite_busy") {
+				log.Printf("Banco de dados bloqueado, aguardando %v antes de tentar novamente...", currentDelay)
+				time.Sleep(currentDelay)
+				sendErr = err
+				continue
 			}
 			
 			return fmt.Errorf("erro ao enviar mensagem: %v", err)
@@ -418,8 +494,9 @@ func main() {
 	}
 	defer cancel()
 
-	// Conectar ao banco de dados SQLite do WhatsApp
-	container, err := sqlstore.New(ctx, "sqlite", "file:"+filepath.Join(dbDir, "store.db")+"?_pragma=foreign_keys(1)", dbLog)
+	// Conectar ao banco de dados SQLite do WhatsApp com timeout e busy_timeout
+	dsn := "file:" + filepath.Join(dbDir, "store.db") + "?_pragma=foreign_keys(1)&_timeout=30000&_busy_timeout=30000&cache=shared"
+	container, err := sqlstore.New(ctx, "sqlite", dsn, dbLog)
 	if err != nil {
 		log.Fatalf("Erro ao conectar ao banco de dados do WhatsApp: %v", err)
 	}
@@ -430,6 +507,9 @@ func main() {
 		log.Fatalf("Erro ao obter device store: %v", err)
 	}
 
+	// Canal para sinalizar que a conexão foi estabelecida
+	connected := make(chan bool, 1) // Adicionando buffer de 1 para evitar deadlock
+
 	// Criar cliente
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 	eventHandler := &EventHandler{
@@ -438,25 +518,33 @@ func main() {
 		groupCache: &GroupCache{
 			groups: make([]*types.GroupInfo, 0),
 		},
+		connected: false, // Inicialmente desconectado
 	}
+	
+	// Adiciona o handler de eventos antes de qualquer outra operação
 	client.AddEventHandler(eventHandler.HandleEvent)
-
-	// Canal para sinalizar que a conexão foi estabelecida
-	connected := make(chan bool, 1) // Adicionando buffer de 1 para evitar deadlock
+	
+	// Registra handler para conexão logo no início
+	client.AddEventHandler(func(evt interface{}) {
+		switch evt.(type) {
+		case *events.Connected:
+			log.Println("=== Conexão estabelecida via evento! ===")
+			eventHandler.connMutex.Lock()
+			eventHandler.connected = true
+			eventHandler.connMutex.Unlock()
+			connected <- true
+		}
+	})
 
 	// Criar WaitGroup para gerenciar goroutines
 	var wg sync.WaitGroup
 
-	// Registra handler para eventos de conexão
-	client.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Connected:
-			log.Println("Evento Connected recebido!")
-			connected <- true
-		case *events.LoggedOut:
-			log.Printf("Evento LoggedOut recebido: %v", v)
-		}
-	})
+	// Inicia o processamento de mensagens em uma goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		eventHandler.processMessageQueue(ctx)
+	}()
 
 	if client.Store.ID == nil {
 		// No ID stored, new login required
@@ -483,6 +571,9 @@ func main() {
 				}
 			} else if evt.Event == "success" {
 				fmt.Println("Login realizado com sucesso!")
+				eventHandler.connMutex.Lock()
+				eventHandler.connected = true
+				eventHandler.connMutex.Unlock()
 				connected <- true
 			} else {
 				fmt.Printf("Login status: %s\n", evt.Event)
@@ -490,25 +581,42 @@ func main() {
 		}
 	} else {
 		// Already logged in, just connect
+		log.Println("Sessão existente encontrada, conectando...")
 		err = client.Connect()
 		if err != nil {
 			log.Fatalf("Erro ao conectar: %v", err)
 		}
-		// Se já estava logado, sinaliza conexão estabelecida
-		connected <- true
+		
+		// Aguarda um momento para garantir que a conexão foi estabelecida
+		time.Sleep(2 * time.Second)
+		
+		// Verifica se realmente está conectado
+		if client.IsConnected() {
+			log.Println("Conexão estabelecida com sessão existente!")
+			eventHandler.connMutex.Lock()
+			eventHandler.connected = true
+			eventHandler.connMutex.Unlock()
+			connected <- true
+		} else {
+			log.Println("Falha ao estabelecer conexão com sessão existente")
+			eventHandler.connMutex.Lock()
+			eventHandler.connected = false
+			eventHandler.connMutex.Unlock()
+		}
 	}
 
-	// Aguarda a conexão ser estabelecida
-	log.Println("Aguardando conexão ser estabelecida...")
+	// Aguarda a conexão ser estabelecida com timeout
+	log.Println("Aguardando conexão ser estabelecida (timeout: 2 minutos)...")
 	select {
 	case <-connected:
-		log.Println("Conexão estabelecida! Iniciando processamento de mensagens...")
-	case <-time.After(60 * time.Second):
-		log.Fatal("Timeout aguardando conexão")
+		log.Println("=== Conexão estabelecida, aguardando 30 segundos antes de iniciar o processamento... ===")
+		// Adiciona um delay de 30 segundos antes de começar
+		time.Sleep(30 * time.Second)
+		log.Println("=== Delay concluído, iniciando processamento de mensagens... ===")
+	case <-time.After(2 * time.Minute):
+		log.Fatal("Timeout aguardando conexão após 2 minutos")
+		return
 	}
-	
-	// Pequena pausa para garantir que a conexão está totalmente estabelecida
-	time.Sleep(2 * time.Second)
 	
 	// Verifica se há mensagens pendentes
 	messages, err := eventHandler.db.GetPendingMessages(ctx)

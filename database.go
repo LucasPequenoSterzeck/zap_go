@@ -108,13 +108,25 @@ func (d *Database) GetPendingMessages(ctx context.Context) ([]Message, error) {
 		}
 
 		// Converte a string de data para time.Time
-		msg.GeradaEm, err = time.Parse("2006-01-02 15:04:05", geradaEmStr)
-		if err != nil {
-			// Se falhar no formato padrão, tenta com o formato ISO
-			msg.GeradaEm, err = time.Parse("2006-01-02 15:04:05.000Z", geradaEmStr+"Z")
-			if err != nil {
-				return nil, fmt.Errorf("erro ao converter data '%s': %v", geradaEmStr, err)
+		// Tenta diferentes formatos de data, do mais específico para o mais genérico
+		formats := []string{
+			"2006-01-02T15:04:05.999999Z",  // Formato com microssegundos
+			"2006-01-02T15:04:05Z",         // Formato ISO8601
+			"2006-01-02 15:04:05.999999Z",  // Formato com espaço
+			"2006-01-02 15:04:05",          // Formato simples
+		}
+
+		var parsed bool
+		for _, format := range formats {
+			msg.GeradaEm, err = time.Parse(format, geradaEmStr)
+			if err == nil {
+				parsed = true
+				break
 			}
+		}
+
+		if !parsed {
+			return nil, fmt.Errorf("erro ao converter data '%s': nenhum formato conhecido", geradaEmStr)
 		}
 
 		msg.Status = 0
@@ -142,8 +154,8 @@ func (d *Database) UpdateMessageStatus(ctx context.Context, msg Message, status 
 		AND mensagem = ?
 	`
 
-	// Converte a data para o formato ISO
-	geradaEmStr := msg.GeradaEm.Format("2006-01-02 15:04:05")
+	// Converte a data para o formato ISO8601
+	geradaEmStr := msg.GeradaEm.Format("2006-01-02T15:04:05.999999Z")
 
 	result, err := d.db.ExecContext(ctx, query, status, msg.Para, geradaEmStr, msg.Destino, msg.Mensagem)
 	if err != nil {
